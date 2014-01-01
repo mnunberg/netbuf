@@ -17,3 +17,7 @@ test: test.c libnetbuf.so
 
 test32: test.c libnetbuf32.so
 	$(CC) -m32 $(CFLAGS) -std=c99 -o $@ test.c $(LFLAGS) -lnetbuf32
+
+check: test test32
+	./test
+	./test32
