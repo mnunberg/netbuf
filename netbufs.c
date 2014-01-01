@@ -230,7 +230,7 @@ nb_SIZE netbuf_get_ublock_alloc_size(void)
 unsigned int netbuf_get_niov(nb_MGR *mgr)
 {
     slist_node *ll;
-    unsigned int ret;
+    unsigned int ret = 0;
 
     SLIST_FOREACH(&mgr->active_blocks, ll) {
         nb_BLOCK *cur = SLIST_ITEM(ll, nb_BLOCK, slnode);
