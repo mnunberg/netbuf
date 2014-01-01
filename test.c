@@ -254,10 +254,10 @@ static void test_structure_sizes(void)
 {
     size_t blocksize, spansize;
 #ifdef _LP64
-    blocksize = 40;
+    blocksize = 48;
     spansize = 16;
 #else
-    blocksize = 32;
+    blocksize = 36;
     spansize = 12;
 #endif
 
