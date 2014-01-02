@@ -261,8 +261,6 @@ static void test_structure_sizes(void)
     spansize = 12;
 #endif
 
-    printf("B:wrap=%u\n", offsetof(nb_BLOCK, start));
-    printf("B");
 
     ASSERT_EQ(blocksize, sizeof(nb_BLOCK));
     ASSERT_EQ(spansize, sizeof(nb_SPAN));

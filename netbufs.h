@@ -1,14 +1,22 @@
 #ifndef NETBUFS_H
 #define NETBUFS_H
 
-#include "slist.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
+
+/******************************************************************************
+ ******************************************************************************
+ ** Introduction                                                             **
+ ******************************************************************************
+ ******************************************************************************/
+
 /**
- *
  * NETBUF - Efficient write buffers
  * ================================
+ *
  * GOALS
  * =====
  *
@@ -26,10 +34,15 @@ extern "C" {
  * (3) Allow a pluggable method by which user-provided data can be plugged
  *     into the span/cursor/flush architecture.
  *
- *
- * Basic terminology and API
- * =========================
- *
+ */
+
+
+/******************************************************************************
+ ******************************************************************************
+ ** Terminology and API                                                      **
+ ******************************************************************************
+ ******************************************************************************/
+/**
  * ~~~ SPAN ~~~
  *
  * a SPAN is a region of contiguous memory; a span is user allocated.
@@ -221,28 +234,24 @@ struct internal_userpacket_sample {
  * (2) If [C] != [W], then also add the value of [C]
  */
 
+#include "slist.h"
 typedef struct netbufs_st nb_MGR;
 typedef struct netbuf_block_st nb_BLOCK;
-typedef struct netbuf_span_st nb_SPAN;
 typedef unsigned int nb_SIZE;
 
+/** TODO: Use a standardized structure */
 typedef struct {
-    const void *iov_base;
+    void *iov_base;
     nb_SIZE iov_len;
 } nb_IOV;
 
-enum {
-    /** Block is part of the manager structure */
-    NETBUF_BLOCK_MANAGED = 0,
-
-    /** Block has been allocated by the manager, but is not part of its structure */
-    NETBUF_BLOCK_STANDALONE,
-
-    /** Block is user provided */
-    NETBUF_BLOCK_USER
-};
-
-struct netbuf_span_st {
+/**
+ * XXX: It is recommended that you maintain the individual fields in your
+ * own structure and then re-create them as needed. The span structure is 16
+ * bytes on 64 bit systems, but can be reduced to 12 if needed. Additionally,
+ * you may already have the 'size' field stored/calculated elsewhere.
+ */
+typedef struct {
     /** PRIVATE: Parent block */
     nb_BLOCK *parent;
 
@@ -251,9 +260,7 @@ struct netbuf_span_st {
 
     /** PUBLIC, write-once: Allocation size */
     nb_SIZE size;
-};
-
-#define NETBUF_SPAN_INIT(span, size) (span)->size = size
+} nb_SPAN;
 
 #define NETBUF_DEALLOC_CACHE 32
 typedef struct {
@@ -269,12 +276,79 @@ typedef struct {
     nb_QDEALLOC _avail[NETBUF_DEALLOC_CACHE];
 } nb_DEALLOC_QUEUE;
 
-struct netbuf_block_st {
-    /** slist pointer */
-    slist_node slnode;
 
-    /** Header type */
-    char type;
+
+/**
+ * Block types. Various block types can be in the manager so long as they
+ * can be mapped to output IOVs.
+ */
+enum {
+    /**
+     * This is the default block type. The block is managed by the manager
+     * and contains a pre-allocated buffer which can be split across multiple
+     * spans.
+     */
+    NETBUF_BLOCK_MANAGED = 0,
+
+    /** An IOV-based block. This wraps an existing IOV structure. */
+    NETBUF_BLOCK_IOV,
+
+    /** Simple block. This block just contains a buffer and a length. */
+    NETBUF_BLOCK_SIMPLE,
+} nb_TYPE;
+
+
+/**
+ * 18 byte header for all block types.
+ */
+#define NETBUF_HEADER \
+    slist_node slnode; \
+    /**
+     * == FOR ALL BLOCKS:
+     * End position for data. This always contains the position at which
+     * the unused data begins.
+     *
+     * == FOR MANAGED BLOCKS ONLY:
+     * If the block only has a single segment then both the following are true:
+     *
+     *  I. cursor == wrap
+     *  II. cursor > start (if not empty)
+     *
+     * If the block has two segments, then both the following are true:
+     *
+     *  I. cursor != wrap
+     *  II. cursor < start
+     *
+     * If the block is empty:
+     *  cursor == start
+     */ \
+    nb_SIZE cursor; \
+    \
+    /**
+     * The flush position for the data. This is the offset of the first
+     * unflushed byte in the block. The flush cursor is updated via end_flush().
+     *
+     *  I. If the block has not been flushed, then flushcur == start. For
+     *     unmanaged blocks, flushcur will be 0.
+     *
+     *  II. If the block has been completely flushed, then flushcur == cursor.
+     *
+     *  III. If the block has been partially flushed, then
+     *       both (I) and (II) should be false.
+     */ \
+     nb_SIZE flushcur; \
+     \
+     /** Block type */ \
+     short type;
+
+typedef struct {
+    NETBUF_HEADER
+} nb_BLOCKHDR;
+
+
+/** MANAGED BLOCK */
+struct netbuf_block_st {
+    NETBUF_HEADER
 
     /** Start position for data */
     nb_SIZE start;
@@ -292,36 +366,6 @@ struct netbuf_block_st {
      *  II. wrap-start is the length of the first segment of data
      */
     nb_SIZE wrap;
-
-    /**
-     * End position for data. This always contains the position at which
-     * the unused data begins.
-     *
-     * If the block only has a single segment then both the following are true:
-     *
-     *  I. cursor == wrap
-     *  II. cursor > start (if not empty)
-     *
-     * If the block has two segments, then both the following are true:
-     *
-     *  I. cursor != wrap
-     *  II. cursor < start
-     *
-     * If the block is empty:
-     *  cursor == start
-     */
-    nb_SIZE cursor;
-
-    /**
-     * The flush position for the data. This is the offset of the first
-     * unflushed byte in the block. The flush cursor is updated via end_flush().
-     *
-     *  I. If the block has not been flushed, then flushcur == start
-     *  II. If the block has been completely flushed, then flushcur == cursor
-     *  III. If the block has been partially flushed, then
-     *       both (I) and (II) should be false.
-     */
-    nb_SIZE flushcur;
 
     /**
      * Total number of bytes allocated in root. This represents the absolute
@@ -343,28 +387,44 @@ struct netbuf_block_st {
     nb_DEALLOC_QUEUE *deallocs;
 };
 
-typedef void (*nb_ublock_callback)(nb_BLOCK *);
 
-typedef struct netbuf_ublock_st {
-    slist_node slnode;
+/**
+ * SIMPLE BLOCK:
+ * This block type simply contains a char buffer and a length. The layout
+ * of this buffer will always be (as far as the manager is concerned):
+ *
+ * [ {S:0}xxxxxxxxx{CA:10} ]
+ */
+typedef struct {
+    NETBUF_HEADER
+    char *buf;
+} nb_LINEBLOCK;
 
-    /** NETBUF_BLOCK_USER */
-    char type;
 
+/**
+ * IOVM BLOCK:
+ *
+ * This block type contains one or more IOV structures. Using these blocks
+ * may be a bit slower because of the difficulty of quick offset calculation.
+ *
+ * The layout is as follows:
+ *
+ * [ {S:0}
+ *    [0] = {iov_base}=xxxxx
+ *          {iov_len}=5
+ *    [1] = {iov_base}=xx
+ *          {iov_len}=2
+ *    ...
+ *    {CA:7}
+ * ]
+ */
+typedef struct {
+    NETBUF_HEADER
     /** Number of IOVs */
-    char niov;
-
-    /** Current flush position within the IOVs */
-    nb_SIZE flushcur;
-    /** Total size of data */
-    nb_SIZE total;
-
-    /** IOV Structures */
-    nb_IOV *iov;
-
-    /** Callback when all spans have been released */
-    nb_ublock_callback callback;
-} nb_UBLOCK;
+    char niovs;
+    /** IOV Array */
+    nb_IOV *iovs;
+} nb_IOVBLOCK;
 
 #define MIN_BLOCK_COUNT 32
 #define ALLOC_HIST_BUCKETS 24
@@ -379,8 +439,13 @@ struct netbufs_st {
     /** Fixed allocation size */
     unsigned int basealloc;
 
+    /** The maximum number of standlone allocated blocks to keep 'available' */
     unsigned int maxblocks;
+
+    /** The current number of allocated blocks */
     unsigned int blockcount;
+
+    /** Total number of allocations */
     unsigned int total_allocs;
 
     /** Contiguous block heads for cache locality */
@@ -399,9 +464,6 @@ struct netbufs_st {
  * The contents of the span are guaranteed to be contiguous (though not aligned)
  * and are available via the SPAN_BUFFER macro.
  *
- * The 'size' property of the span parameter should be set prior to calling
- * this function
- *
  * @return 0 if successful, -1 on error
  */
 int netbuf_reserve_span(nb_MGR *mgr, nb_SPAN *span);
@@ -412,6 +474,9 @@ int netbuf_reserve_span(nb_MGR *mgr, nb_SPAN *span);
 #define NETBUF_FLUSHED_NONE 0
 /**
  * Indicate whether the specified span has been flushed to the network.
+ * @param mgr the manager in which the span is reserver
+ * @param span the span to query
+ *
  * @return one of
  *  NETBUF_FLUSHED_PARTIAL: Part of the span has been written
  *  NETBUF_FLUSHED_FULL: The entire span has been written
@@ -427,14 +492,30 @@ int netbuf_get_flush_status(const nb_MGR *mgr, const nb_SPAN *span);
  * (2) have just been scheduled (and are being removed due to error handling)
  * (3) have been partially sent to a connection which is being closed.
  *
- * Additionally, the span must currently be located either at the very beginning
- * or the very end of the buffer. This should never be a problem in normal
- * situations, where packets are enqueued in order.
- *
- * TODO: This is a bit weird. Any ideas about this?
+ * @param mgr the manager in which this span is reserved
+ * @param span the span
  */
 void netbuf_release_span(nb_MGR *mgr, nb_SPAN *span);
 
+/**
+ * Appends a block to the flushlist. The block and its contents must not
+ * be modified or freed until it is flushed and the user has finished with it.
+ *
+ * User blocks are logically equivalent to spans, except their allocation
+ * mechanisms are different.
+ */
+void netbuf_append_block(nb_MGR *mgr, nb_BLOCKHDR *bheader);
+
+/**
+ * Removes a block from the flushlist. The same constraints which apply to
+ * removing spans also apply to removing blocks
+ */
+void netbuf_delete_block(nb_MGR *mgr, nb_BLOCKHDR *bheader);
+
+/**
+ * Gets the flush status for a block.
+ */
+int netbuf_get_block_flush_status(nb_MGR *mgr, nb_BLOCKHDR *bheader);
 
 /**
  * Gets the number of IOV structures required to flush the entire contents of
@@ -469,16 +550,6 @@ nb_SIZE netbuf_start_flush(nb_MGR *mgr, nb_IOV *iov, int niov);
 void netbuf_end_flush(nb_MGR *mgr, nb_SIZE nflushed);
 
 /**
- * Resets any flushing state.
- */
-#define netbuf_reset_flush(mgr) \
-    do { \
-        mgr->flushing_block = NULL; \
-        mgr->flushing_pos = 0; \
-    } while (0);
-
-
-/**
  * Informational function to get the total size of all data in the
  * buffers. This traverses all blocks, so call this for debugging only.
  */
@@ -493,13 +564,7 @@ nb_SIZE netbuf_get_size(const nb_MGR *mgr);
  * size will allow wrapping. If disabled, then only the packed size will be
  * available. Consider:
  *
- * R=root
- * o=unused
- * x=used
- * A=allocated
- * E=end
- *
- * [ {R:0}ooooooo{S:10}xxxxxxxxx{E:10}ooooo{A:5} ]
+ * [ ooooooo{S:10}xxxxxxxxx{C:10}ooooo{A:5} ]
  *
  * If wrapping is allowed, then the maximum span size will be 10, from 0..10
  * but the last 5 bytes at the end will be lost for the duration of the block.
@@ -511,38 +576,23 @@ nb_SIZE netbuf_get_size(const nb_MGR *mgr);
  */
 nb_SIZE netbuf_get_max_span_size(const nb_MGR *mgr, int allow_wrap);
 
+/**
+ * Initializes an nb_MGR structure
+ * @param mgr the manager to initialize
+ */
 void netbuf_init(nb_MGR *mgr);
+
+/**
+ * Frees up any allocated resources for a given manager
+ * @param mgr the manager for which to release resources
+ */
 void netbuf_cleanup(nb_MGR *mgr);
+
+/**
+ * Dump the internal structure of the manager to the screen. Useful for
+ * debugging.
+ */
 void netbuf_dump_status(nb_MGR *mgr);
-
-
-/**
- * ABI Safety.
- *
- * Get the size required for allocation of a user block. This is runtime
- * dependent and may change between versions. Does sizeof(nb_BLOCK)
- *
- * Alignment constraints apply.
- */
-nb_SIZE netbuf_get_ublock_alloc_size(void);
-
-/**
- * Initialize a user block.
- * @param block a block allocated with at least ublock_alloc_size bytes
- * available.
- *
- * @param root the root chunk of memory for this block
- * @param cursor the offset at which the block's data ends
- * @param start the offset at which the block's data begins. This should
- *  normally be 0 if the
- */
-void netbuf_init_ublock(nb_MGR *mgr,
-                        nb_BLOCK *block,
-                        const void *root,
-                        nb_SIZE cursor,
-                        nb_SIZE start,
-                        nb_SIZE wrap,
-                        nb_ublock_callback callback);
 
 #ifdef __cplusplus
 }

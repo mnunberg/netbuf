@@ -1,4 +1,4 @@
-CFLAGS=-Wall -std=c89
+CFLAGS=-Wall -std=c89 -ggdb3
 LFLAGS=-Wl,-rpath='$$ORIGIN' -L$(shell pwd)
 
 all: libnetbuf.so libnetbuf32.so test test32
