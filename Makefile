@@ -13,10 +13,10 @@ libnetbuf32.so: netbufs.c
 	$(CC) -m32 $(CFLAGS) -shared -o $@ -fPIC $^
 
 test: test.c libnetbuf.so
-	$(CC) $(CFLAGS) -std=c99 -o $@ test.c $(LFLAGS) -lnetbuf
+	$(CC) $(CFLAGS) -o $@ test.c $(LFLAGS) -lnetbuf
 
 test32: test.c libnetbuf32.so
-	$(CC) -m32 $(CFLAGS) -std=c99 -o $@ test.c $(LFLAGS) -lnetbuf32
+	$(CC) -m32 $(CFLAGS) -o $@ test.c $(LFLAGS) -lnetbuf32
 
 check: test test32
 	./test

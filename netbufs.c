@@ -19,14 +19,10 @@
 #define MINIMUM(a, b) a < b ? a : b
 #define MAXIMUM(a, b) a > b ? a : b
 
-#define BASEALLOC 32768
-
-#define BLOCK_IS_FLUSHED(header) ((header)->flushcur == (header)->cursor)
-
 #define BLOCK_IS_EMPTY(block) ((block)->start == (block)->cursor)
 
-#define FIRST_BLOCK(mgr) \
-    (SLIST_ITEM((mgr)->active_blocks.first, nb_BLOCKHDR, slnode))
+#define FIRST_BLOCK(pool) \
+    (SLIST_ITEM((pool)->active.first, nb_MBLOCK, slnode))
 
 #define LAST_BLOCK(mgr) \
     (SLIST_ITEM((mgr)->active_blocks.last, nb_BLOCKHDR, slnode))
@@ -38,42 +34,64 @@
     ((block)->deallocs && SLIST_IS_EMPTY(&(block)->deallocs->pending))
 
 
+#define MALLOC_WITH_STATS(p, size, mgr) \
+    p = malloc(size); \
+    mgr->total_allocs++; \
+    mgr->total_bytes += size;
+
+#define CALLOC_WITH_STATS(p, n, elemsz, mgr) \
+    p = calloc(n, elemsz); \
+    mgr->total_allocs++; \
+    mgr->total_bytes += (n) * (elemsz);
+
+/** Static forward decls */
+static void mblock_release_data(nb_MBPOOL*,nb_MBLOCK*,nb_SIZE,nb_SIZE);
+static void mblock_release_ptr(nb_MBPOOL*,char*,nb_SIZE);
+static void mblock_init(nb_MBPOOL*);
+static void mblock_cleanup(nb_MBPOOL*);
 
 /******************************************************************************
  ******************************************************************************
  ** Allocation/Reservation                                                   **
  ******************************************************************************
  ******************************************************************************/
-static int block_is_standalone(nb_MGR *mgr, nb_BLOCK *block)
+
+/**
+ * Determines whether the block is allocated as a standalone block, or if it's
+ * part of a larger allocation
+ */
+static int
+mblock_is_standalone(nb_MBLOCK *block)
 {
-    char *begin = (char *)&(mgr->_blocks[0]);
-    char *end = begin + sizeof(mgr->_blocks);
-    return ! ((char *)block >= begin && (char *)block < end);
+    return block->parent == NULL;
 }
 
-static nb_BLOCK* alloc_new_block(nb_MGR *mgr, nb_SIZE capacity)
+/**
+ * Allocates a new block with at least the given capacity and places it
+ * inside the active list.
+ */
+static nb_MBLOCK*
+alloc_new_block(nb_MBPOOL *pool, nb_SIZE capacity)
 {
     int ii;
-    nb_BLOCK *ret;
+    nb_MBLOCK *ret = NULL;
 
-    for (ii = 0; ii < MIN_BLOCK_COUNT; ii++) {
-        if (!mgr->_blocks[ii].nalloc) {
-            ret = mgr->_blocks + ii;
+    for (ii = 0; ii < pool->ncacheblocks; ii++) {
+        if (!pool->cacheblocks[ii].nalloc) {
+            ret = pool->cacheblocks + ii;
             break;
         }
     }
 
     if (!ret) {
-        ret = calloc(1, sizeof(*ret));
-        mgr->total_allocs++;
-        ret->type = 0;
+        CALLOC_WITH_STATS(ret, 1, sizeof(*ret), pool->mgr);
     }
 
     if (!ret) {
         return NULL;
     }
 
-    ret->nalloc = mgr->basealloc;
+    ret->nalloc = pool->basealloc;
 
     while (ret->nalloc < capacity) {
         ret->nalloc *= 2;
@@ -81,11 +99,10 @@ static nb_BLOCK* alloc_new_block(nb_MGR *mgr, nb_SIZE capacity)
 
     ret->wrap = 0;
     ret->cursor = 0;
-    ret->root = malloc(ret->nalloc);
-    mgr->total_allocs++;
+    MALLOC_WITH_STATS(ret->root, ret->nalloc, pool->mgr);
 
     if (!ret->root) {
-        if (block_is_standalone(mgr, ret)) {
+        if (mblock_is_standalone(ret)) {
             free(ret);
         }
         return NULL;
@@ -94,31 +111,43 @@ static nb_BLOCK* alloc_new_block(nb_MGR *mgr, nb_SIZE capacity)
     return ret;
 }
 
-static nb_BLOCK* find_free_block(nb_MGR *mgr, nb_SIZE capacity)
+/**
+ * Finds an available block within the available list. The block will have
+ * room for at least capacity bytes.
+ */
+static nb_MBLOCK*
+find_free_block(nb_MBPOOL *pool, nb_SIZE capacity)
 {
     slist_iterator iter;
-
-    SLIST_ITERFOR(&mgr->avail_blocks, &iter) {
-        nb_BLOCK *cur = SLIST_ITEM(iter.cur, nb_BLOCK, slnode);
+    SLIST_ITERFOR(&pool->avail, &iter) {
+        nb_MBLOCK *cur = SLIST_ITEM(iter.cur, nb_MBLOCK, slnode);
         if (cur->nalloc >= capacity) {
-            slist_iter_remove(&mgr->avail_blocks, &iter);
+            slist_iter_remove(&pool->avail, &iter);
 
-            if (block_is_standalone(mgr, cur)) {
-                mgr->blockcount--;
+            if (mblock_is_standalone(cur)) {
+                pool->curblocks--;
             }
 
             return cur;
         }
     }
+
     return NULL;
 }
 
-static int reserve_empty_block(nb_MGR *mgr, nb_SPAN *span)
+/**
+ * Find a new block for the given span and initialize it for a reserved size
+ * correlating to the span.
+ * The block may either be popped from the available section or allocated
+ * as a standalone depending on current constraints.
+ */
+static int
+reserve_empty_block(nb_MBPOOL *pool, nb_SPAN *span)
 {
-    nb_BLOCK *block;
+    nb_MBLOCK *block;
 
-    if ( (block = find_free_block(mgr, span->size)) == NULL) {
-        block = alloc_new_block(mgr, span->size);
+    if ( (block = find_free_block(pool, span->size)) == NULL) {
+        block = alloc_new_block(pool, span->size);
     }
 
     if (!block) {
@@ -133,18 +162,19 @@ static int reserve_empty_block(nb_MGR *mgr, nb_SPAN *span)
 
     block->deallocs = NULL;
 
-    slist_append(&mgr->active_blocks, &block->slnode);
+    slist_append(&pool->active, &block->slnode);
     return 0;
 }
 
-static int reserve_active_block(nb_BLOCKHDR *bhdr, nb_SPAN *span)
+/**
+ * Attempt to reserve space from the currently active block for the given
+ * span.
+ * @return 0 if the active block had enough space and the span was initialized
+ * and nonzero otherwise.
+ */
+static int
+reserve_active_block(nb_MBLOCK *block, nb_SPAN *span)
 {
-    nb_BLOCK *block = (nb_BLOCK *)bhdr;
-
-    if (bhdr->type != NETBUF_BLOCK_MANAGED) {
-        return -1;
-    }
-
     if (BLOCK_HAS_DEALLOCS(block)) {
         return -1;
     }
@@ -164,6 +194,7 @@ static int reserve_active_block(nb_BLOCKHDR *bhdr, nb_SPAN *span)
         } else {
             return -1;
         }
+
     } else {
         /* Already wrapped */
         if (block->start - block->cursor >= span->size) {
@@ -176,20 +207,21 @@ static int reserve_active_block(nb_BLOCKHDR *bhdr, nb_SPAN *span)
     }
 }
 
-int netbuf_reserve_span(nb_MGR *mgr, nb_SPAN *span)
+static int
+mblock_reserve_data(nb_MBPOOL *pool, nb_SPAN *span)
 {
-    nb_BLOCK *block;
+    nb_MBLOCK *block;
     int rv;
 
-    if (SLIST_IS_EMPTY(&mgr->active_blocks)) {
-        return reserve_empty_block(mgr, span);
+    if (SLIST_IS_EMPTY(&pool->active)) {
+        return reserve_empty_block(pool, span);
 
     } else {
-        block = SLIST_ITEM(mgr->active_blocks.last, nb_BLOCK, slnode);
-        rv = reserve_active_block((nb_BLOCKHDR *)block, span);
+        block = SLIST_ITEM(pool->active.last, nb_MBLOCK, slnode);
+        rv = reserve_active_block(block, span);
 
         if (rv != 0) {
-            return reserve_empty_block(mgr, span);
+            return reserve_empty_block(pool, span);
         }
 
         span->parent = block;
@@ -199,60 +231,156 @@ int netbuf_reserve_span(nb_MGR *mgr, nb_SPAN *span)
 
 /******************************************************************************
  ******************************************************************************
- ** Informational Routines                                                   **
+ ** Out-Of-Order Deallocation Functions                                      **
  ******************************************************************************
  ******************************************************************************/
-static nb_SIZE get_block_size(nb_BLOCKHDR *header)
+static void
+ooo_queue_dealoc(nb_MGR *mgr, nb_MBLOCK *block, nb_SPAN *span)
 {
-    nb_SIZE ret;
-    nb_BLOCK *block = (nb_BLOCK *)header;
+    nb_QDEALLOC *qd;
+    nb_DEALLOC_QUEUE *queue;
+    nb_SPAN qespan;
 
-    switch (header->type) {
-    case NETBUF_BLOCK_SIMPLE:
-    case NETBUF_BLOCK_IOV:
-        return header->cursor;
+    if (!block->deallocs) {
+        CALLOC_WITH_STATS(queue, 1, sizeof(*queue), mgr);
+        queue->qpool.basealloc = sizeof(*qd) * mgr->settings.dea_basealloc;
+        queue->qpool.ncacheblocks = mgr->settings.dea_cacheblocks;
+        queue->qpool.mgr = mgr;
 
-    case NETBUF_BLOCK_MANAGED:
-        ret = block->wrap - block->start;
-        if (block->cursor < block->start) {
-            ret += block->cursor;
+        mblock_init(&queue->qpool);
+        block->deallocs = queue;
+    }
+
+    queue = block->deallocs;
+    qespan.size = sizeof(*qd);
+    mblock_reserve_data(&queue->qpool, &qespan);
+
+    qd = (nb_QDEALLOC *)SPAN_BUFFER(&qespan);
+    qd->offset = span->offset;
+    qd->size = span->size;
+    if (queue->min_offset > qd->offset) {
+        queue->min_offset = qd->offset;
+    }
+    slist_append(&queue->pending, &qd->slnode);
+}
+
+static void
+ooo_apply_dealloc(nb_MBLOCK *block, nb_SIZE offset)
+{
+    nb_SIZE min_next = -1;
+    slist_iterator iter;
+    nb_DEALLOC_QUEUE *queue = block->deallocs;
+
+    SLIST_ITERFOR(&queue->pending, &iter) {
+        nb_QDEALLOC *cur = SLIST_ITEM(iter.cur, nb_QDEALLOC, slnode);
+        if (cur->offset == offset) {
+            slist_iter_remove(&block->deallocs->pending, &iter);
+            mblock_release_ptr(&queue->qpool, (char *)cur, sizeof(*cur));
+        } else if (cur->offset < min_next) {
+            min_next = cur->offset;
         }
-        break;
     }
-    return ret;
+    queue->min_offset = min_next;
 }
 
-nb_SIZE netbuf_get_size(const nb_MGR *mgr)
+
+static void
+mblock_release_data(nb_MBPOOL *pool,
+                    nb_MBLOCK *block, nb_SIZE size, nb_SIZE offset)
 {
-    nb_SIZE ret = 0;
+    if (offset == block->start) {
+        /** Removing from the beginning */
+        block->start += size;
+
+        if (block->deallocs && block->deallocs->min_offset == block->start) {
+            ooo_apply_dealloc(block, block->start);
+        }
+
+        if (!BLOCK_IS_EMPTY(block) && block->start == block->wrap) {
+            block->wrap = block->cursor;
+            block->start = 0;
+        }
+
+    } else if (offset + size == block->cursor) {
+        /** Removing from the end */
+        if (block->cursor == block->wrap) {
+            /** Single region, no wrap */
+            block->cursor -= size;
+            block->wrap -= size;
+
+        } else {
+            block->cursor -= size;
+            if (!block->cursor) {
+                /** End has reached around */
+                block->cursor = block->wrap;
+            }
+        }
+
+    } else {
+        nb_SPAN span = { block, offset, size };
+        ooo_queue_dealoc(pool->mgr, block, &span);
+        return;
+    }
+
+    if (!BLOCK_IS_EMPTY(block)) {
+        return;
+    }
+
+    {
+        slist_iterator iter;
+        SLIST_ITERFOR(&pool->active, &iter) {
+            if (&block->slnode == iter.cur) {
+                slist_iter_remove(&pool->active, &iter);
+                break;
+            }
+        }
+    }
+
+    if (pool->curblocks < pool->maxblocks) {
+        slist_append(&pool->avail, &block->slnode);
+        pool->curblocks++;
+
+    } else {
+        free(block->root);
+        pool->mgr->total_bytes -= block->nalloc;
+        block->root = NULL;
+        if (mblock_is_standalone(block)) {
+            pool->mgr->total_bytes -= sizeof(*block);
+            free(block);
+        }
+    }
+}
+
+static void
+mblock_release_ptr(nb_MBPOOL *pool, char * ptr, nb_SIZE size)
+{
+    nb_MBLOCK *block;
+    nb_SIZE offset;
     slist_node *ll;
-
-    SLIST_FOREACH(&mgr->active_blocks, ll) {
-        ret += get_block_size(SLIST_ITEM(ll, nb_BLOCKHDR, slnode));
+    SLIST_FOREACH(&pool->active, ll) {
+        block = SLIST_ITEM(ll, nb_MBLOCK, slnode);
+        if (block->root < ptr) {
+            continue;
+        }
+        if (block->root + block->nalloc <= ptr) {
+            continue;
+        }
+        offset = ptr - block->root;
+        mblock_release_data(pool, block, size, offset);
+        return;
     }
 
-    return ret;
+    abort();
 }
 
-nb_SIZE netbuf_get_max_span_size(const nb_MGR *mgr, int allow_wrap)
+static int
+mblock_get_next_size(const nb_MBPOOL *pool, int allow_wrap)
 {
-    nb_BLOCKHDR *bhdr;
-    nb_BLOCK *block;
-
-    if (SLIST_IS_EMPTY(&mgr->avail_blocks)) {
+    if (SLIST_IS_EMPTY(&pool->avail)) {
         return 0;
     }
 
-    bhdr = LAST_BLOCK(mgr);
-    if (bhdr->type == NETBUF_BLOCK_IOV) {
-        return 0;
-    }
-
-    block = (nb_BLOCK *)bhdr;
-
-    if (block->deallocs) {
-        return 0;
-    }
+    nb_MBLOCK *block = FIRST_BLOCK(pool);
 
     if (BLOCK_HAS_DEALLOCS(block)) {
         return 0;
@@ -275,72 +403,86 @@ nb_SIZE netbuf_get_max_span_size(const nb_MGR *mgr, int allow_wrap)
     return block->nalloc - block->wrap;
 }
 
-unsigned int netbuf_get_niov(nb_MGR *mgr)
+static void
+free_blocklist(nb_MBPOOL *pool, slist_root *list)
+{
+    slist_iterator iter;
+    SLIST_ITERFOR(list, &iter) {
+        nb_MBLOCK *block = SLIST_ITEM(iter.cur, nb_MBLOCK, slnode);
+
+        if (block->root) {
+            free(block->root);
+            pool->mgr->total_bytes -= block->nalloc;
+        }
+
+        if (block->deallocs) {
+            slist_iterator dea_iter;
+            nb_DEALLOC_QUEUE *queue = block->deallocs;
+
+            SLIST_ITERFOR(&queue->pending, &dea_iter) {
+                nb_QDEALLOC *qd = SLIST_ITEM(dea_iter.cur, nb_QDEALLOC, slnode);
+                mblock_release_ptr(&queue->qpool, (char *)qd, sizeof(*qd));
+            }
+
+            mblock_cleanup(&queue->qpool);
+            free(queue);
+            block->deallocs = NULL;
+            pool->mgr->total_bytes -= sizeof(*block->deallocs);
+        }
+
+        if (mblock_is_standalone(block)) {
+            pool->mgr->total_bytes -= sizeof(*block);
+            free(block);
+        }
+    }
+}
+
+
+static void
+mblock_cleanup(nb_MBPOOL *pool)
+{
+    free_blocklist(pool, &pool->active);
+    free_blocklist(pool, &pool->avail);
+    free(pool->cacheblocks);
+    pool->mgr->total_bytes -= sizeof(*pool->cacheblocks) * pool->ncacheblocks;
+}
+
+static void
+mblock_init(nb_MBPOOL *pool)
+{
+    int ii;
+    pool->cacheblocks = calloc(pool->ncacheblocks, sizeof(*pool->cacheblocks));
+    for (ii = 0; ii < pool->ncacheblocks; ii++) {
+        pool->cacheblocks[ii].parent = pool;
+    }
+}
+
+int
+netbuf_mblock_reserve(nb_MGR *mgr, nb_SPAN *span)
+{
+    return mblock_reserve_data(&mgr->datapool, span);
+}
+
+/******************************************************************************
+ ******************************************************************************
+ ** Informational Routines                                                   **
+ ******************************************************************************
+ ******************************************************************************/
+nb_SIZE
+netbuf_mblock_get_next_size(const nb_MGR *mgr, int allow_wrap)
+{
+    return mblock_get_next_size(&mgr->datapool, allow_wrap);
+}
+
+unsigned int
+netbuf_get_niov(nb_MGR *mgr)
 {
     slist_node *ll;
     unsigned int ret = 0;
-
-    SLIST_FOREACH(&mgr->active_blocks, ll) {
-        nb_BLOCKHDR *header = SLIST_ITEM(ll, nb_BLOCKHDR, slnode);
-        nb_BLOCK *cur = (nb_BLOCK *)header;
-
-        if (header->type == NETBUF_BLOCK_IOV) {
-            nb_IOVBLOCK *iovblk = (nb_IOVBLOCK *)header;
-            ret += iovblk->niovs;
-            continue;
-        }
-
-        if (BLOCK_IS_EMPTY(cur)) {
-            continue;
-        }
-
+    SLIST_FOREACH(&mgr->sendq.pending, ll) {
         ret++;
-        if (cur->cursor < cur->start) {
-            ret++;
-        }
     }
 
-    return ret;
-}
-
-static nb_SIZE blkiov_fill_iov(nb_IOVBLOCK *blkiov,
-                               nb_IOV **target,
-                               nb_IOV *end)
-{
-    nb_SIZE offset = blkiov->flushcur;
-    nb_SIZE ret = 0;
-
-    unsigned char ii;
-    nb_IOV *dst = *target;
-
-    for (ii = 0; ii < blkiov->niovs; ii++) {
-        const nb_IOV *src = blkiov->iovs + ii;
-
-        if (!offset) {
-            *dst = *src;
-            ret += dst->iov_len;
-            if (++dst == end) {
-                break;
-            }
-            continue;
-        }
-
-        if (offset >= src->iov_len) {
-            offset -= src->iov_len;
-            continue;
-
-        } else {
-            dst->iov_base = (char *)src->iov_base + offset;
-            dst->iov_len = src->iov_len - offset;
-            ret += dst->iov_len;
-            offset = 0;
-            if (++dst == end) {
-                break;
-            }
-        }
-    }
-
-    *target = dst;
     return ret;
 }
 
@@ -349,304 +491,134 @@ static nb_SIZE blkiov_fill_iov(nb_IOVBLOCK *blkiov,
  ** Flush Routines                                                           **
  ******************************************************************************
  ******************************************************************************/
-nb_SIZE netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov)
+static nb_SNDQELEM *
+get_sendqe(nb_SENDQ* sq, const nb_IOV *bufinfo)
+{
+    nb_SNDQELEM *sndqe;
+    nb_SPAN span;
+    span.size = sizeof(*sndqe);
+    mblock_reserve_data(&sq->elempool, &span);
+    sndqe = (nb_SNDQELEM *)SPAN_BUFFER(&span);
+
+    sndqe->base = bufinfo->iov_base;
+    sndqe->len = bufinfo->iov_len;
+    return sndqe;
+}
+
+void
+netbuf_enqueue(nb_MGR *mgr, const nb_IOV *bufinfo)
+{
+    nb_SENDQ *q = &mgr->sendq;
+    nb_SNDQELEM *win;
+
+    if (SLIST_IS_EMPTY(&q->pending)) {
+        win = get_sendqe(q, bufinfo);
+        slist_append(&q->pending, &win->slnode);
+
+    } else {
+        win = SLIST_ITEM(q->pending.last, nb_SNDQELEM, slnode);
+        if (win->base + win->len == bufinfo->iov_base) {
+            win->len += bufinfo->iov_len;
+
+        } else {
+            win = get_sendqe(q, bufinfo);
+            slist_append(&q->pending, &win->slnode);
+        }
+    }
+}
+
+void
+netbuf_enqueue_span(nb_MGR *mgr, nb_SPAN *span)
+{
+    nb_IOV spinfo = { SPAN_BUFFER(span), span->size };
+    netbuf_enqueue(mgr, &spinfo);
+}
+
+nb_SIZE
+netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov)
 {
     nb_SIZE ret = 0;
     nb_IOV *iov_end = iovs + niov + 1;
     nb_IOV *iov = iovs;
-    nb_BLOCKHDR *header;
     slist_node *ll;
+    nb_SENDQ *sq = &mgr->sendq;
+    nb_SNDQELEM *win = NULL;
 
-    #define SET_IOV_LEN(len) iov->iov_len = len; ret += len;
+    if (sq->last_requested) {
+        if (sq->last_offset != sq->last_requested->len) {
+            win = sq->last_requested;
+            assert(win->len > sq->last_offset);
 
-    /** If there's nothing to flush, return immediately */
-    if (SLIST_IS_EMPTY(&mgr->active_blocks)) {
-        iov[0].iov_base = NULL;
-        iov[0].iov_len = 0;
-        return 0;
+            iov->iov_len = win->len - sq->last_offset;
+            iov->iov_base = win->base + sq->last_offset;
+            ret += iov->iov_len;
+            iov++;
+        }
+
+        ll = sq->last_requested->slnode.next;
+
+    } else {
+        ll = sq->pending.first;
     }
 
-    SLIST_FOREACH(&mgr->active_blocks, ll) {
-        nb_BLOCK *block;
-        header = SLIST_ITEM(ll, nb_BLOCKHDR, slnode);
+    while (ll && iov != iov_end) {
+        win = SLIST_ITEM(ll, nb_SNDQELEM, slnode);
+        iov->iov_len = win->len;
+        iov->iov_base = win->base;
 
-        if (BLOCK_IS_FLUSHED(header)) {
-            continue;
-        }
-
-        if (header->type == NETBUF_BLOCK_IOV) {
-            nb_IOVBLOCK *blkiov = (nb_IOVBLOCK *)header;
-            ret += blkiov_fill_iov(blkiov, &iov, iov_end);
-            if (iov == iov_end) {
-                break;
-            }
-
-            continue;
-
-        } else if (header->type == NETBUF_BLOCK_SIMPLE) {
-            nb_LINEBLOCK *sblk = (nb_LINEBLOCK *)header;
-            iov->iov_base = sblk->buf + sblk->flushcur;
-            SET_IOV_LEN(sblk->cursor - sblk->flushcur);
-            if (++iov == iov_end) {
-                break;
-            }
-            continue;
-        }
-
-        block = (nb_BLOCK *)header;
-
-        if (BLOCK_IS_EMPTY(block)) {
-            continue;
-        }
-
-        /** Flush cursor is either in the first region or the second region */
-        if (block->cursor == block->wrap) {
-            /** Only one region */
-
-            iov->iov_base = block->root + block->flushcur;
-            SET_IOV_LEN(block->wrap - block->flushcur);
-            continue;
-
-        } else {
-            /** Two regions, but we may have flushed the first one */
-            if (block->flushcur > block->cursor) {
-                /** First one isn't flushed completely */
-                iov->iov_base = block->root + block->flushcur;
-                SET_IOV_LEN(block->wrap - block->flushcur);
-
-                if (!block->cursor) {
-                    continue;
-                }
-
-                if (++iov == iov_end) {
-                    break;
-                }
-                iov->iov_base = block->root;
-                SET_IOV_LEN(block->cursor);
-            } else {
-                iov->iov_base = block->root + block->flushcur;
-                SET_IOV_LEN(block->cursor - block->flushcur);
-            }
-        }
+        ret += iov->iov_len;
+        iov++;
+        ll = ll->next;
     }
 
-    #undef SET_IOV_LEN
+    if (win) {
+        sq->last_requested = win;
+        sq->last_offset = win->len;
+    }
+
     return ret;
 }
 
-void netbuf_end_flush(nb_MGR *mgr, unsigned int nflushed)
+void
+netbuf_end_flush(nb_MGR *mgr, unsigned int nflushed)
 {
+    nb_SENDQ *q = &mgr->sendq;
+    slist_iterator iter;
+    SLIST_ITERFOR(&q->pending, &iter) {
+        nb_SNDQELEM *win = SLIST_ITEM(iter.cur, nb_SNDQELEM, slnode);
+        nb_SIZE to_chop = MINIMUM(win->len, nflushed);
 
-    slist_node *ll;
-    SLIST_FOREACH(&mgr->active_blocks, ll) {
-        nb_SIZE to_chop;
-        nb_BLOCK *block;
-        nb_BLOCKHDR *header = SLIST_ITEM(ll, nb_BLOCKHDR, slnode);
-
-        if (header->type != NETBUF_BLOCK_MANAGED) {
-            to_chop = MINIMUM(nflushed, header->cursor - header->flushcur);
-            header->flushcur += to_chop;
-            nflushed -= to_chop;
-            continue;
+        win->len -= to_chop;
+        nflushed -= to_chop;
+        if (win == q->last_requested) {
+            q->last_requested = NULL;
+            q->last_offset = 0;
         }
 
-        block = (nb_BLOCK *)header;
-        if (block->flushcur >= block->start) {
-            /** [xxxxxSxxxxxFxxxxxCW] */
-            to_chop = MINIMUM(nflushed, block->wrap - block->flushcur);
-            block->flushcur += to_chop;
-            nflushed -= to_chop;
-            if (block->flushcur == block->wrap && block->cursor != block->wrap) {
+        if (!win->len) {
+            slist_iter_remove(&q->pending, &iter);
+            mblock_release_ptr(&mgr->sendq.elempool, (char *)win, sizeof(*win));
 
-                /** [xxxxCoooooSxxxxxFW] */
-                if (!nflushed) {
-                    block->flushcur = 0;
-                    return;
-                }
-
-                to_chop = MINIMUM(nflushed, block->cursor);
-                nflushed -= to_chop;
-                block->flushcur += to_chop;
-            }
         } else {
-            /** [xxxxxFxxxCoooooSxxxxxW] */
-
-            /** Flush cursor is less than start. Second segment */
-            to_chop = MINIMUM(nflushed, block->cursor - block->flushcur);
-            block->flushcur += to_chop;
-            nflushed -= to_chop;
+            win->base +=  to_chop;
         }
 
         if (!nflushed) {
             break;
         }
-
     }
 }
 
-int netbuf_get_flush_status(const nb_MGR *mgr, const nb_SPAN *span)
-{
-    nb_BLOCK *block = span->parent;
-    if (block->cursor == block->flushcur) {
-        /** Entire block flushed */
-        return NETBUF_FLUSHED_FULL;
-    }
-
-    if (span->offset >= block->start) {
-        /** first region */
-        if (block->flushcur < block->start) {
-            /** cursor already in second region */
-            return NETBUF_FLUSHED_FULL;
-        }
-    } else {
-        /** second region */
-        if (block->flushcur > block->start) {
-            /** cursor still in first region */
-            return NETBUF_FLUSHED_NONE;
-        }
-    }
-
-    if (block->flushcur <= span->offset) {
-        return NETBUF_FLUSHED_NONE;
-    }
-
-    if (block->flushcur > span->offset + span->size) {
-        return NETBUF_FLUSHED_FULL;
-    }
-
-    (void)mgr;
-
-    return NETBUF_FLUSHED_PARTIAL;
-}
-
-/******************************************************************************
- ******************************************************************************
- ** Out-Of-Order Deallocation Functions                                      **
- ******************************************************************************
- ******************************************************************************/
-static void ooo_queue_dealoc(nb_BLOCK *block, nb_SPAN *span)
-{
-    int ii;
-
-    nb_QDEALLOC *qd;
-    nb_DEALLOC_QUEUE *queue;
-
-    if (!block->deallocs) {
-        block->deallocs = calloc(1, sizeof(*block->deallocs));
-    }
-    queue = block->deallocs;
-
-    for (ii = 0; ii < NETBUF_DEALLOC_CACHE; ii++) {
-        if (queue->_avail[ii].size == 0) {
-            qd = queue->_avail + ii;
-            break;
-        }
-    }
-
-    if (!qd) {
-        qd = calloc(1, sizeof(*qd));
-        qd->unmanaged = 1;
-    }
-
-    qd->offset = span->offset;
-    qd->size = span->size;
-    if (queue->min_offset > qd->offset) {
-        queue->min_offset = qd->offset;
-    }
-    slist_append(&queue->pending, &qd->slnode);
-}
-
-static void ooo_apply_dealloc(nb_BLOCK *block, nb_SIZE offset)
-{
-    nb_SIZE min_next = -1;
-    slist_iterator iter;
-    nb_DEALLOC_QUEUE *queue = block->deallocs;
-
-    SLIST_ITERFOR(&queue->pending, &iter) {
-        nb_QDEALLOC *cur = SLIST_ITEM(iter.cur, nb_QDEALLOC, slnode);
-        if (cur->offset == offset) {
-            slist_iter_remove(&block->deallocs->pending, &iter);
-            block->start += cur->size;
-            if (cur->unmanaged) {
-                free(cur);
-            } else {
-                cur->size = 0;
-            }
-
-        } else if (cur->offset < min_next) {
-            min_next = cur->offset;
-        }
-    }
-    queue->min_offset = min_next;
-}
 
 /******************************************************************************
  ******************************************************************************
  ** Release                                                                  **
  ******************************************************************************
  ******************************************************************************/
-void netbuf_release_span(nb_MGR *mgr, nb_SPAN *span)
+void
+netbuf_mblock_release(nb_MGR *mgr, nb_SPAN *span)
 {
-    nb_BLOCK *block = span->parent;
-
-    if (span->offset == block->start) {
-        /** Removing from the beginning */
-        block->start += span->size;
-
-        if (block->deallocs && block->deallocs->min_offset == block->start) {
-            ooo_apply_dealloc(block, block->start);
-        }
-
-        if (!BLOCK_IS_EMPTY(block) && block->start == block->wrap) {
-            block->wrap = block->cursor;
-            block->start = 0;
-        }
-
-    } else if (span->offset + span->size == block->cursor) {
-        /** Removing from the end */
-        if (block->cursor == block->wrap) {
-            /** Single region, no wrap */
-            block->cursor -= span->size;
-            block->wrap -= span->size;
-
-        } else {
-            block->cursor -= span->size;
-            if (!block->cursor) {
-                /** End has reached around */
-                block->cursor = block->wrap;
-            }
-        }
-
-    } else {
-        ooo_queue_dealoc(block, span);
-        return;
-    }
-
-    if (!BLOCK_IS_EMPTY(block)) {
-        return;
-    }
-
-    {
-        slist_iterator iter;
-        SLIST_ITERFOR(&mgr->active_blocks, &iter) {
-            if (&block->slnode == iter.cur) {
-                slist_iter_remove(&mgr->active_blocks, &iter);
-                break;
-            }
-        }
-    }
-
-    if (mgr->blockcount < mgr->maxblocks) {
-        slist_append(&mgr->avail_blocks, &block->slnode);
-        mgr->blockcount++;
-
-    } else {
-        free(block->root);
-        block->root = NULL;
-        if (block_is_standalone(mgr, block)) {
-            free(block);
-        }
-    }
+    mblock_release_data(&mgr->datapool, span->parent, span->size, span->offset);
 }
 
 /******************************************************************************
@@ -654,53 +626,47 @@ void netbuf_release_span(nb_MGR *mgr, nb_SPAN *span)
  ** Init/Cleanup                                                             **
  ******************************************************************************
  ******************************************************************************/
-void netbuf_init(nb_MGR *mgr)
+void netbuf_default_settings(nb_SETTINGS *settings)
+{
+    settings->data_basealloc = NB_DATA_BASEALLOC;
+    settings->data_cacheblocks = NB_DATA_CACHEBLOCKS;
+    settings->dea_basealloc = NB_MBDEALLOC_BASEALLOC;
+    settings->dea_cacheblocks = NB_MBDEALLOC_CACHEBLOCKS;
+    settings->sndq_basealloc = NB_SNDQ_BASEALLOC;
+    settings->sndq_cacheblocks = NB_SNDQ_CACHEBLOCKS;
+}
+
+void
+netbuf_init(nb_MGR *mgr, const nb_SETTINGS *user_settings)
 {
     memset(mgr, 0, sizeof(*mgr));
-    mgr->basealloc = BASEALLOC;
-    mgr->maxblocks = MIN_BLOCK_COUNT * 2;
-    mgr->blockcount = MIN_BLOCK_COUNT;
-}
+    nb_MBPOOL *sqpool = &mgr->sendq.elempool;
+    nb_MBPOOL *bufpool = &mgr->datapool;
 
-static void free_blocklist(nb_MGR *mgr, slist_root *list)
-{
-    slist_iterator iter;
-    SLIST_ITERFOR(list, &iter) {
-        nb_BLOCK *block;
-        nb_BLOCKHDR *header = SLIST_ITEM(iter.cur, nb_BLOCKHDR, slnode);
-        slist_iter_remove(list, &iter);
-        if (header->type != NETBUF_BLOCK_MANAGED) {
-            continue;
-        }
-
-        block = (nb_BLOCK *)header;
-        if (block->root) {
-            free(block->root);
-        }
-
-        if (block->deallocs) {
-            slist_iterator dea_iter;
-            SLIST_ITERFOR(&block->deallocs->pending, &dea_iter) {
-                nb_QDEALLOC *qd = SLIST_ITEM(dea_iter.cur, nb_QDEALLOC, slnode);
-                if (qd->unmanaged) {
-                    free(qd);
-                }
-            }
-
-            free(block->deallocs);
-            block->deallocs = NULL;
-        }
-
-        if (block_is_standalone(mgr, block)) {
-            free(block);
-        }
+    if (user_settings) {
+        mgr->settings = *user_settings;
+    } else {
+        netbuf_default_settings(&mgr->settings);
     }
+
+    /** Set our defaults */
+    sqpool->basealloc = sizeof(nb_SNDQELEM) * mgr->settings.sndq_basealloc;
+    sqpool->ncacheblocks = mgr->settings.sndq_cacheblocks;
+    sqpool->mgr = mgr;
+    mblock_init(sqpool);
+
+    bufpool->basealloc = mgr->settings.data_basealloc;
+    bufpool->ncacheblocks = mgr->settings.data_cacheblocks;
+    bufpool->mgr = mgr;
+    mblock_init(bufpool);
 }
 
-void netbuf_cleanup(nb_MGR *mgr)
+
+void
+netbuf_cleanup(nb_MGR *mgr)
 {
-    free_blocklist(mgr, &mgr->active_blocks);
-    free_blocklist(mgr, &mgr->avail_blocks);
+    mblock_cleanup(&mgr->sendq.elempool);
+    mblock_cleanup(&mgr->datapool);
 }
 
 /******************************************************************************
@@ -709,7 +675,8 @@ void netbuf_cleanup(nb_MGR *mgr)
  ******************************************************************************
  ******************************************************************************/
 
-static void dump_managed_block(nb_BLOCK *block)
+static void
+dump_managed_block(nb_MBLOCK *block)
 {
     const char *indent = "  ";
     printf("%sBLOCK(MANAGED)=%p; BUF=%p, %uB\n", indent,
@@ -746,43 +713,32 @@ static void dump_managed_block(nb_BLOCK *block)
         }
     }
     printf("]\n");
-
 }
-static void dump_iovblock(nb_IOVBLOCK *block)
-{
-    int ii;
-    const char *indent = "  ";
-    printf("%sBLOCK(IOV)=%p; LEN=%u, FLUSHED=%u\n",
-           indent, (void *)block, block->cursor, block->flushcur);
 
-    indent = "    ";
-    for (ii = 0; ii < block->niovs; ii++) {
-        printf("IOV {root=%p, len=%u}\n",
-               block->iovs[ii].iov_base, block->iovs[ii].iov_len);
+static void dump_sendq(nb_SENDQ *q)
+{
+    const char *indent = "  ";
+    slist_node *ll;
+    printf("Send Queue\n");
+    SLIST_FOREACH(&q->pending, ll) {
+        nb_SNDQELEM *e = SLIST_ITEM(ll, nb_SNDQELEM, slnode);
+        printf("%s[Base=%p, Len=%u]\n", indent, e->base, e->len);
+        if (q->last_requested == e) {
+            printf("%s<Current Flush Limit @%u^^^>\n", indent, q->last_offset);
+        }
     }
 }
 
-static void dump_simpleblock(nb_LINEBLOCK *block)
-{
-    const char *indent = "  ";
-    printf("%sBLOCK(SIMPLE)=%p; LEN=%u, FLUSHED=%u, BUF=%p\n",
-           indent, (void *)block, block->cursor, block->flushcur, block->buf);
-}
-
-void netbuf_dump_status(nb_MGR *mgr)
+void
+netbuf_dump_status(nb_MGR *mgr)
 {
     slist_node *ll;
     printf("Status for MGR=%p [nallocs=%u]\n", (void *)mgr, mgr->total_allocs);
     printf("ACTIVE:\n");
 
-    SLIST_FOREACH(&mgr->active_blocks, ll) {
-        nb_BLOCKHDR *block = SLIST_ITEM(ll, nb_BLOCKHDR, slnode);
-        if (block->type == NETBUF_BLOCK_MANAGED) {
-            dump_managed_block((nb_BLOCK *)block);
-        } else if (block->type == NETBUF_BLOCK_IOV) {
-            dump_iovblock((nb_IOVBLOCK *)block);
-        } else {
-            dump_simpleblock((nb_LINEBLOCK *)block);
-        }
+    SLIST_FOREACH(&mgr->datapool.active, ll) {
+        nb_MBLOCK *block = SLIST_ITEM(ll, nb_MBLOCK, slnode);
+        dump_managed_block(block);
     }
+    dump_sendq(&mgr->sendq);
 }
