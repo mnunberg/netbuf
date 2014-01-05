@@ -73,7 +73,7 @@ mblock_is_standalone(nb_MBLOCK *block)
 static nb_MBLOCK*
 alloc_new_block(nb_MBPOOL *pool, nb_SIZE capacity)
 {
-    int ii;
+    unsigned int ii;
     nb_MBLOCK *ret = NULL;
 
     for (ii = 0; ii < pool->ncacheblocks; ii++) {
@@ -466,7 +466,7 @@ mblock_cleanup(nb_MBPOOL *pool)
 static void
 mblock_init(nb_MBPOOL *pool)
 {
-    int ii;
+    unsigned int ii;
     pool->cacheblocks = calloc(pool->ncacheblocks, sizeof(*pool->cacheblocks));
     for (ii = 0; ii < pool->ncacheblocks; ii++) {
         pool->cacheblocks[ii].parent = pool;

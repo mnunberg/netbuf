@@ -64,6 +64,8 @@ slist_iter_incr(slist_root *list, slist_iterator *iter)
     }
 
     assert(iter->cur != iter->prev);
+
+    (void)list;
 }
 
 static INLINE void
