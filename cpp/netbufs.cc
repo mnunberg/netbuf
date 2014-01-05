@@ -106,7 +106,7 @@ Pool::reserveActive(Alloc *alloc)
             return true;
 
         } else if (block->start >= alloc->size) {
-            alloc->offset= 0;
+            alloc->offset = 0;
             block->cursor = alloc->size;
             return true;
 
@@ -118,6 +118,7 @@ Pool::reserveActive(Alloc *alloc)
             alloc->offset = block->cursor;
             block->cursor += alloc->size;
             return true;
+
         } else {
             return false;
         }
@@ -184,11 +185,11 @@ Pool::relocateEmpty(Block *block)
 {
     assert(active.remove(&block->slnode));
     if (!block->isStandalone()) {
-        available.append(&block->slnode);
+        available.prepend(&block->slnode);
 
     } else if(curblocks < max_alloc_blocks) {
         curblocks++;
-        available.append(&block->slnode);
+        available.prepend(&block->slnode);
 
     } else {
         delete block;
