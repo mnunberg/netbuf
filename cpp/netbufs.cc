@@ -9,10 +9,6 @@
 using namespace Netbufs;
 using namespace SList;
 
-template <typename T> T* llCast(SList::Node *n)
-{
-    return reinterpret_cast<T*>((char *)n - offsetof(T, slnode));
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
@@ -48,15 +44,13 @@ bool
 Pool::reserveEmpty(Alloc *alloc)
 {
     Block *block = NULL;
-
-    for (IteratorEx iter = available.beginEx(); !iter.end(); iter.inc()) {
-        Block *block = llCast<Block>(iter.cur);
+    for (Blkiter iter = available.begin(); iter != available.end(); iter++) {
+        Block *block = iter;
 
         if (alloc->size > block->nalloc) {
             continue;
         }
-
-        iter.remove(&available);
+        available.remove(iter);
         break;
     }
 
@@ -79,14 +73,14 @@ Pool::reserveEmpty(Alloc *alloc)
     block->cursor = alloc->size;
     block->deallocs = NULL;
 
-    active.append(&block->slnode);
+    active.push_back(block);
     return true;
 }
 
 bool
 Pool::reserveActive(Alloc *alloc)
 {
-    Block *block = llCast<Block>(active.first);
+    Block *block = active.front();
     alloc->parent = block;
 
 
@@ -183,13 +177,14 @@ Pool::release(Alloc *alloc)
 void
 Pool::relocateEmpty(Block *block)
 {
-    assert(active.remove(&block->slnode));
+    assert(active.remove(block));
+
     if (!block->isStandalone()) {
-        available.prepend(&block->slnode);
+        available.push_front(block);
 
     } else if(curblocks < max_alloc_blocks) {
         curblocks++;
-        available.prepend(&block->slnode);
+        available.push_front(block);
 
     } else {
         delete block;
@@ -201,8 +196,8 @@ void
 Pool::release(char *ptr, size_t len)
 {
     // Find the corresponding block
-    for (Iterator iter = active.begin(); !iter.end(); iter.inc()) {
-        Block *block = llCast<Block>(iter.cur);
+    for (Blkiter iter = active.begin(); iter != active.end(); iter++) {
+        Block *block = iter;
         if (!block->isOwnerOf(ptr, len)) {
             continue;
         }
@@ -234,17 +229,18 @@ Block::queueDealloc(const Alloc *alloc)
     if (deallocs->minoffset > info->offset) {
         deallocs->minoffset = info->offset;
     }
-    deallocs->ll.append(&info->slnode);
+    deallocs->ll.push_back(info);
 }
 
 void
 Block::applyDeallocs(Size curstart)
 {
     Size min_next = -1;
-    for (IteratorEx iter = deallocs->ll.beginEx(); !iter.end(); iter.inc()) {
-        DeallocInfo *info = llCast<DeallocInfo>(iter.cur);
+    DeallocList *ll = &deallocs->ll;
+    for (DeallocIter iter = ll->begin(); iter != ll->end(); iter++) {
+        DeallocInfo *info = iter;
         if (info->offset == curstart) {
-            iter.remove(&deallocs->ll);
+            ll->erase(iter);
             deallocs->qpool.release((char *)info, sizeof(*info));
         } else {
             min_next = std::min(min_next, info->offset);
@@ -291,7 +287,7 @@ SendQueue::startFlush(IOVector *iov, int niov)
     Size ret = 0;
     IOVector *iov_end = iov + (niov + 1);
     SendItem *win = NULL;
-    SList::Node *ll;
+    SendItem *first = NULL;
 
     if (last_requested != NULL) {
         if (last_offset != last_requested->len) {
@@ -302,18 +298,17 @@ SendQueue::startFlush(IOVector *iov, int niov)
             ret += iov->length;
             iov++;
         }
-        ll = &last_requested->slnode;
+        first = last_requested;
 
     } else {
-        ll = pending.first;
+        first = pending.front();
     }
 
-    while (ll && iov != iov_end) {
-        win = llCast<SendItem>(ll);
+    for (SendFIter iter = pending.ffrom(first); iter != pending.fend(); iter++) {
+        win = iter;
         iov->assign(win->base, win->len);
         ret += win->len;
         iov++;
-        ll = ll->next;
     }
 
     if (win) {
@@ -327,9 +322,8 @@ SendQueue::startFlush(IOVector *iov, int niov)
 void
 SendQueue::endFlush(Size nflushed)
 {
-    for (IteratorEx iter = pending.beginEx(); !iter.end(); iter++) {
-
-        SendItem *elem = llCast<SendItem>(iter.cur);
+    for (SendList::Iterator iter = pending.begin(); iter != pending.end(); iter++) {
+        SendItem *elem = iter;
         Size to_chop = std::min(elem->len, nflushed);
         elem->len -= to_chop;
         nflushed -= to_chop;
@@ -340,7 +334,7 @@ SendQueue::endFlush(Size nflushed)
         }
 
         if (elem->len == 0) {
-            iter.remove(&pending);
+            pending.remove(iter);
             elempool.release((char *)elem, sizeof(*elem));
         } else {
             elem->base += to_chop;
@@ -362,7 +356,7 @@ SendQueue::allocSendInfo(const IOVector *iov)
     curitem->base = (char *)iov->base;
     curitem->len = iov->length;
 
-    pending.append(&curitem->slnode);
+    pending.push_back(curitem);
 }
 
 void
@@ -376,7 +370,7 @@ SendQueue::enqueue(const IOVector *iov)
         return;
     }
 
-    curitem = llCast<SendItem>(pending.last);
+    curitem = pending.back();
     if (curitem->base + curitem->len == iov->base) {
         curitem->len += iov->length;
     } else {
@@ -416,20 +410,20 @@ Block::~Block()
 
 DeallocQueue::~DeallocQueue()
 {
-    for (Iterator iter = ll.begin(); !iter.end(); iter.inc()) {
-        DeallocInfo *info = llCast<DeallocInfo>(iter.cur);
+    for (DeallocIter iter = ll.begin(); iter != ll.end(); iter++) {
+        DeallocInfo *info = iter;
         qpool.release((char *)info, sizeof(*info));
     }
 }
 
 void
-Pool::freeBlocklist(List& ll)
+Pool::freeBlocklist(Blocklist& ll)
 {
-    for (IteratorEx iter = ll.beginEx(); !iter.end(); iter++) {
-        Block* block = llCast<Block>(iter.cur);
+    for (Blkiter iter = ll.begin(); iter != ll.end(); iter++) {
+        Block* block = iter;
 
         if (block->isStandalone()) {
-            iter.remove(&ll);
+            ll.erase(iter);
             delete block;
         }
     }

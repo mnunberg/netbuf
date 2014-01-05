@@ -47,16 +47,20 @@ struct Alloc {
         parent((Block *)buf), offset(NETBUFS_INVALID_OFFSET), size(length) {}
 };
 
-
 // Item within the send queue
 struct SendItem {
     // The next item in the list
-    SList::Node slnode;
+    SList::SListNode slnode;
     // The buffer
     char *base;
     // Length of the buffer
     Size len;
 };
+
+
+typedef SList::SList<SendItem, &SendItem::slnode> SendList;
+typedef SendList::FastIterator SendFIter;
+
 
 // Queue of items to send
 struct SendQueue {
@@ -75,7 +79,7 @@ struct SendQueue {
 
     SendQueue() : last_requested(NULL), last_offset(0) {}
 
-    SList::List pending;
+    SendList pending;
     SendItem *last_requested;
     Size last_offset;
     Pool elempool;

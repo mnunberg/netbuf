@@ -14,13 +14,13 @@ struct Manager;
 struct Pool;
 
 struct DeallocInfo {
-    SList::Node slnode;
+    SList::SListNode slnode;
     Size offset;
     Size size;
 };
 
 struct Block {
-    SList::Node slnode;
+    SList::SListNode slnode;
     Size start;
     Size wrap;
     Size cursor;
@@ -62,9 +62,16 @@ struct Block {
     ~Block();
 };
 
+
+typedef SList::SList<Block, &Block::slnode> Blocklist;
+typedef Blocklist::Iterator Blkiter;
+typedef Blocklist::FastIterator BlkFIter;
+typedef SList::SList<DeallocInfo, &DeallocInfo::slnode> DeallocList;
+typedef DeallocList::Iterator DeallocIter;
+
 struct Pool {
-    SList::List active;
-    SList::List available;
+    Blocklist active;
+    Blocklist available;
     Size max_alloc_blocks;
     Size curblocks;
     std::vector<Block> cacheblocks;
@@ -87,11 +94,11 @@ struct Pool {
     // Initializes the pool to its default settings.
     void init();
 
-    inline void freeBlocklist(SList::List &ll);
+    inline void freeBlocklist(Blocklist &ll);
 };
 
 struct DeallocQueue {
-    SList::List ll;
+    DeallocList ll;
     Size minoffset;
     Pool qpool;
     DeallocQueue(const AllocationSettings& settings)
