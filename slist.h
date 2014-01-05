@@ -36,6 +36,7 @@ typedef struct slist_iterator_st {
     slist_node *cur;
     slist_node *prev;
     slist_node *next;
+    int removed;
 } slist_iterator;
 
 #define slist_iter_end(list, iter) ((iter)->cur == NULL)
