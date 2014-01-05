@@ -1,5 +1,7 @@
 #ifndef NETBUFS_DEFS_H
 #define NETBUFS_DEFS_H
+#include <cstdlib>
+#include "slist.h"
 
 namespace Netbufs {
 
@@ -25,6 +27,7 @@ namespace Netbufs {
 
 /** How many data blocks to allocate per manager */
 #define NB_DATA_CACHEBLOCKS 16
+
 /** Default data allocation size */
 #define NB_DATA_BASEALLOC 32768
 
@@ -47,6 +50,15 @@ struct Settings {
 struct IOVector {
     void *base;
     Size length;
+
+    void assign(void *base, Size length) {
+        this->base = base;
+        this->length = length;
+    }
+
+    IOVector() : base(NULL), length(0) { }
 };
 
 }
+
+#endif /* NETBUFS_DEFS_H */

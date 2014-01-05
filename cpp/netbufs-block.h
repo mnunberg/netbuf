@@ -8,111 +8,96 @@
 
 namespace Netbufs {
 
-template <typename T> class SList {
-    T* first;
-    T* last;
-
-    struct Node {
-        Node *next;
-
-        T * getItem() const {
-            return (T *) (char *)this + sizeof(*this);
-        }
-    };
-
-    struct Iterator {
-        T* cur;
-        T* prev;
-        T* next;
-        SList *parent;
-
-        Iterator(SList *parent) : parent(parent), cur(parent->first), prev(NULL) {
-            if (cur) {
-                next = cur->next;
-            }
-        }
-
-        bool isEnd() const {
-            return cur == NULL;
-        }
-
-        void start() {
-
-        }
-
-        void operator++() {
-            if (prev != NULL) {
-                prev = prev->next;
-            } else {
-                prev = parent->first;
-            }
-            cur = next;
-            if (cur != NULL) {
-                next = cur->next;
-            } else {
-                next = NULL;
-            }
-        }
-    };
-
-    bool empty() const {
-        return first == NULL && last == NULL;
-    }
-
-    void append(const T *item) {
-        if (empty()) {
-            first = last = item;
-        } else {
-            last->next = item;
-            last = item;
-        }
-    }
-
-    void prepend(const T *item) {
-        if (empty()) {
-            first = last = item;
-        } else {
-            item->next = first;
-            first = item;
-        }
-    }
-};
-
 struct DeallocInfo;
+struct DeallocQueue;
+struct Manager;
+struct Pool;
 
 struct DeallocInfo {
-    SList<DeallocInfo>::Node next;
+    SList::Node slnode;
     Size offset;
     Size size;
 };
 
 struct Block {
-    SList<Block>::Node next;
+    SList::Node slnode;
     Size start;
     Size wrap;
     Size cursor;
+    Size nalloc;
     char* root;
     DeallocQueue *deallocs;
+    Pool *parent;
+
+    Block() : start(0),
+            wrap(0),
+            cursor(0),
+            nalloc(0),
+            root(NULL),
+            deallocs(NULL), parent(NULL) {}
+
+    inline void applyDeallocs(Size curstart);
+    inline void queueDealloc(const Alloc *alloc);
+    inline Size getNextSize(bool allow_wrap=true) const;
+
+    bool isStandalone() const {
+        return parent == NULL;
+    }
+
+    inline bool hasDeallocs() const;
+
+    bool isOwnerOf(char *ptr, size_t len) const {
+        if (ptr < root) {
+            return false;
+        }
+        if (ptr > root + nalloc) {
+            return false;
+        }
+        return true;
+    }
+
+    bool empty() const {
+        return start == cursor;
+    }
+    ~Block();
 };
 
-
 struct Pool {
-    SList<Block> active;
-    SList<Block> available;
-    Size basealloc;
-    Size maxblocks;
+    SList::List active;
+    SList::List available;
+    Size max_alloc_blocks;
     Size curblocks;
     std::vector<Block> cacheblocks;
 
     bool reserve(Alloc *alloc);
     void release(Alloc *alloc);
-    Manager *mgr;
+    inline void release(char *ptr, size_t len);
+
+    inline Block* createNew(Size);
+    inline void relocateEmpty(Block *bloc);
+    inline bool reserveEmpty(Alloc *);
+    inline bool reserveActive(Alloc *);
+
+    AllocationSettings settings;
+    AllocationSettings deaSettings;
+
+    ~Pool();
+    Pool() : max_alloc_blocks(64), curblocks(0) {}
+
+    // Initializes the pool to its default settings.
+    void init();
+
+    inline void freeBlocklist(SList::List &ll);
 };
 
 struct DeallocQueue {
-    SList<DeallocInfo> ll;
+    SList::List ll;
     Size minoffset;
     Pool qpool;
+    DeallocQueue(const AllocationSettings& settings)
+        : minoffset(0) {}
+
+    ~DeallocQueue();
 };
 
 }
