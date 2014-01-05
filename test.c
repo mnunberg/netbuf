@@ -11,22 +11,6 @@
 #define SMALL_BUF_SIZE 50
 #define ASSERT_EQ(a, b) assert((a) == (b))
 
-/**
- * Reads a series of IOVs to a buffer. Note that buf must be large enough
- * to contain the data
- * @return the length of the buffer
- */
-static nb_SIZE iov_to_buf(char *buf, nb_IOV *iov, int niovs)
-{
-    int ii;
-    char *p = buf;
-    for (ii = 0; ii < niovs; ii++) {
-        memcpy(p, iov[ii].iov_base, iov[ii].iov_len);
-        p += iov[ii].iov_len;
-    }
-    return p - buf;
-}
-
 static void test_basic(void)
 {
     nb_MGR mgr;
@@ -132,6 +116,12 @@ static void test_flush(void)
     spans[0].size = 20;
     rv = netbuf_mblock_reserve(&mgr, &spans[0]);
     ASSERT_EQ(0, rv);
+    netbuf_mblock_release(&mgr, &spans[0]);
+
+    for (ii = 1; ii < 3; ii++) {
+        netbuf_mblock_release(&mgr, spans + ii);
+    }
+
     netbuf_dump_status(&mgr);
     netbuf_cleanup(&mgr);
 }
@@ -142,6 +132,10 @@ static void test_wrapped(void)
     nb_SETTINGS settings;
     int rv;
     nb_SPAN span1, span2, span3;
+
+#ifdef NETBUFS_LIBC_PROXY
+    return;
+#endif
 
     netbuf_default_settings(&settings);
     settings.data_basealloc = 40;
@@ -230,6 +224,7 @@ static void test_multi_flush(void)
     memset(SPAN_BUFFER(&span2), 'B', span2.size);
     memset(SPAN_BUFFER(&span3), 'C', span3.size);
 
+#ifndef NETBUFS_LIBC_PROXY
     ASSERT_EQ(100, iov->iov_len);
     assert_iov_eq(iov, 0, 'A');
     assert_iov_eq(iov, 50, 'B');
@@ -248,6 +243,7 @@ static void test_multi_flush(void)
     netbuf_end_flush(&mgr, 50);
     sz = netbuf_start_flush(&mgr, iov, 10);
     ASSERT_EQ(0, sz);
+#endif
 
     netbuf_mblock_release(&mgr, &span1);
     netbuf_mblock_release(&mgr, &span2);

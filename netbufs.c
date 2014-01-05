@@ -213,6 +213,14 @@ mblock_reserve_data(nb_MBPOOL *pool, nb_SPAN *span)
     nb_MBLOCK *block;
     int rv;
 
+#ifdef NETBUFS_LIBC_PROXY
+    block = malloc(sizeof(*block) + span->size);
+    block->root = ((char *)block) + sizeof(*block);
+    span->parent = block;
+    span->offset = 0;
+    return 0;
+#endif
+
     if (SLIST_IS_EMPTY(&pool->active)) {
         return reserve_empty_block(pool, span);
 
@@ -357,9 +365,17 @@ mblock_release_ptr(nb_MBPOOL *pool, char * ptr, nb_SIZE size)
     nb_MBLOCK *block;
     nb_SIZE offset;
     slist_node *ll;
+
+#ifdef NETBUFS_LIBC_PROXY
+    block = ptr - sizeof(*block);
+    free(block);
+    return;
+#endif
+
+
     SLIST_FOREACH(&pool->active, ll) {
         block = SLIST_ITEM(ll, nb_MBLOCK, slnode);
-        if (block->root < ptr) {
+        if (block->root > ptr) {
             continue;
         }
         if (block->root + block->nalloc <= ptr) {
@@ -618,7 +634,11 @@ netbuf_end_flush(nb_MGR *mgr, unsigned int nflushed)
 void
 netbuf_mblock_release(nb_MGR *mgr, nb_SPAN *span)
 {
+#ifdef NETBUFS_LIBC_PROXY
+    free(span->parent);
+#else
     mblock_release_data(&mgr->datapool, span->parent, span->size, span->offset);
+#endif
 }
 
 /******************************************************************************
@@ -665,6 +685,14 @@ netbuf_init(nb_MGR *mgr, const nb_SETTINGS *user_settings)
 void
 netbuf_cleanup(nb_MGR *mgr)
 {
+    slist_iterator iter;
+
+    SLIST_ITERFOR(&mgr->sendq.pending, &iter) {
+        nb_SNDQELEM *e = SLIST_ITEM(iter.cur, nb_SNDQELEM, slnode);
+        slist_iter_remove(&mgr->sendq.pending, &iter);
+        mblock_release_ptr(&mgr->sendq.elempool, (char *)e, sizeof(*e));
+    }
+
     mblock_cleanup(&mgr->sendq.elempool);
     mblock_cleanup(&mgr->datapool);
 }
