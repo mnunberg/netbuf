@@ -54,6 +54,11 @@ typedef struct {
     nb_SIZE size;
 } nb_SPAN;
 
+#define CREATE_STANDALONE_SPAN(span, buf, len) \
+    (span)->parent = (nb_MBLOCK *)buf; \
+    (span)->offset = (nb_SIZE)-1; \
+    (span)->size = len;
+
 
 typedef struct {
     slist_node slnode;
