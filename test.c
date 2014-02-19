@@ -1,23 +1,22 @@
-#include "netbufs.h"
 #include <stdio.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include "netbufs.h"
 
 
 #define BIG_BUF_SIZE 5000
 #define SMALL_BUF_SIZE 50
-#define ASSERT_EQ(a, b) assert((a) == (b))
+#define ASSERT_EQ(a, b) if ((a) != (b)) { *(char *)0x00 = 'A'; }
 
 static void test_basic(void)
 {
     nb_MGR mgr;
-    netbuf_init(&mgr, NULL);
-    netbuf_cleanup(&mgr);
-    netbuf_init(&mgr, NULL);
-
     int rv;
     int ii;
     int n_bigspans = 20;
@@ -25,6 +24,10 @@ static void test_basic(void)
 
     nb_SPAN spans_big[20];
     nb_SPAN spans_small[2000];
+    netbuf_init(&mgr, NULL);
+    netbuf_cleanup(&mgr);
+    netbuf_init(&mgr, NULL);
+
 
     for (ii = 0; ii < n_bigspans; ii++) {
         int filler = 'a' + ii;
@@ -63,8 +66,10 @@ static void test_basic(void)
         netbuf_mblock_release(&mgr, spans_small + ii);
     }
 
-    nb_IOV iov[20];
-    netbuf_start_flush(&mgr, iov, 20);
+    {
+        nb_IOV iov[20];
+        netbuf_start_flush(&mgr, iov, 20, NULL);
+    }
     netbuf_cleanup(&mgr);
 }
 
@@ -89,12 +94,12 @@ static void test_flush(void)
     ASSERT_EQ(rv, 0);
 
     netbuf_enqueue_span(&mgr, &span);
-    sz = netbuf_start_flush(&mgr, iov, 1);
+    sz = netbuf_start_flush(&mgr, iov, 1, NULL);
     ASSERT_EQ(32, sz);
     ASSERT_EQ(32, iov[0].iov_len);
     netbuf_end_flush(&mgr, 20);
 
-    sz = netbuf_start_flush(&mgr, iov, 1);
+    sz = netbuf_start_flush(&mgr, iov, 1, NULL);
     ASSERT_EQ(12, sz);
     netbuf_end_flush(&mgr, 12);
     netbuf_mblock_release(&mgr, &span);
@@ -108,7 +113,7 @@ static void test_flush(void)
         netbuf_enqueue_span(&mgr, spans + ii);
     }
 
-    sz = netbuf_start_flush(&mgr, iov, 10);
+    sz = netbuf_start_flush(&mgr, iov, 10, NULL);
     ASSERT_EQ(150, sz);
     netbuf_end_flush(&mgr, 75);
     netbuf_mblock_release(&mgr, &spans[0]);
@@ -217,7 +222,7 @@ static void test_multi_flush(void)
     netbuf_enqueue_span(&mgr, &span1);
     netbuf_enqueue_span(&mgr, &span2);
 
-    sz = netbuf_start_flush(&mgr, iov, 10);
+    sz = netbuf_start_flush(&mgr, iov, 10, NULL);
     ASSERT_EQ(100, sz);
 
     memset(SPAN_BUFFER(&span1), 'A', span1.size);
@@ -230,7 +235,7 @@ static void test_multi_flush(void)
     assert_iov_eq(iov, 50, 'B');
 
     netbuf_enqueue_span(&mgr, &span3);
-    sz = netbuf_start_flush(&mgr, &iov[1], 0);
+    sz = netbuf_start_flush(&mgr, &iov[1], 0, NULL);
     ASSERT_EQ(sz, 50);
     assert_iov_eq(&iov[1], 0, 'C');
     ASSERT_EQ(50, iov[1].iov_len);
@@ -241,7 +246,7 @@ static void test_multi_flush(void)
     netbuf_dump_status(&mgr);
 
     netbuf_end_flush(&mgr, 50);
-    sz = netbuf_start_flush(&mgr, iov, 10);
+    sz = netbuf_start_flush(&mgr, iov, 10, NULL);
     ASSERT_EQ(0, sz);
 #endif
 
@@ -335,8 +340,9 @@ static void test_ooo(void)
     netbuf_init(&mgr, NULL);
 
     for (ii = 0; ii < 3; ii++) {
+        int rv;
         spans[ii].size = 10;
-        int rv = netbuf_mblock_reserve(&mgr, spans + ii);
+        rv = netbuf_mblock_reserve(&mgr, spans + ii);
         ASSERT_EQ(0, rv);
     }
 

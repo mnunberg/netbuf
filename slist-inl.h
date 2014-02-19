@@ -4,7 +4,7 @@
 
 #ifndef INLINE
 #ifdef _MSC_VER
-#define INLINE __inline__
+#define INLINE __inline
 #elif __GNUC__
 #define INLINE __inline__
 #else
@@ -33,12 +33,11 @@ slist_contains(slist_root *list, slist_node *item)
 #define slist_sanity_insert(l, n)
 #endif
 
-
 static INLINE void
-slist_iter_init(const slist_root *list, slist_iterator *iter)
+slist_iter_init_at(slist_node *node, slist_iterator *iter)
 {
-    iter->cur = list->first;
-    iter->prev = (slist_node *)&list->first;
+    iter->cur = node->next;
+    iter->prev = node;
     iter->removed = 0;
 
     if (iter->cur) {
@@ -46,6 +45,12 @@ slist_iter_init(const slist_root *list, slist_iterator *iter)
     } else {
         iter->next = NULL;
     }
+}
+
+static INLINE void
+slist_iter_init(const slist_root *list, slist_iterator *iter)
+{
+    slist_iter_init_at((slist_node *)&list->first, iter);
 }
 
 static INLINE void
@@ -72,7 +77,8 @@ static INLINE void
 slist_iter_remove(slist_root *list, slist_iterator *iter)
 {
     iter->prev->next = iter->next;
-    if (!list->first) {
+    /** GCC strict aliasing. Yay. */
+    if ((void *)&list->first == (void *)iter->prev || list->first == NULL) {
         list->last = NULL;
     }
     iter->removed = 1;

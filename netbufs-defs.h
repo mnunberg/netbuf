@@ -39,10 +39,18 @@ typedef struct {
     nb_SIZE data_basealloc;
 } nb_SETTINGS;
 
-/** TODO: Use a standardized structure */
+#ifndef _WIN32
 typedef struct {
     void *iov_base;
-    nb_SIZE iov_len;
+    size_t iov_len;
 } nb_IOV;
+#define NETBUF_IOV_INIT(base, len) { base, len }
+#else
+typedef struct {
+    ULONG iov_len;
+    void *iov_base;
+} nb_IOV;
+#define NETBUF_IOV_INIT(base, len) { len, base }
+#endif
 
 #endif /* NETBUFS_DEFS_H */

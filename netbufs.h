@@ -54,9 +54,11 @@ typedef struct {
     nb_SIZE size;
 } nb_SPAN;
 
+#define NETBUFS_INVALID_OFFSET (nb_SIZE)-1
+
 #define CREATE_STANDALONE_SPAN(span, buf, len) \
     (span)->parent = (nb_MBLOCK *)buf; \
-    (span)->offset = (nb_SIZE)-1; \
+    (span)->offset = NETBUFS_INVALID_OFFSET; \
     (span)->size = len;
 
 
@@ -64,11 +66,18 @@ typedef struct {
     slist_node slnode;
     char *base;
     nb_SIZE len;
+    /** Extra 4 bytes here. WHAT WE DO!!! */
 } nb_SNDQELEM;
 
 typedef struct {
     /** Linked list of pending spans to send */
     slist_root pending;
+
+    /**
+     * List of PDUs to be flushed. A PDU is comprised of one or more IOVs
+     * (or even a subsection thereof)
+     */
+    slist_root pdus;
 
     /** The last window which was part of the previous fill call */
     nb_SNDQELEM *last_requested;
@@ -80,10 +89,12 @@ typedef struct {
      */
     nb_SIZE last_offset;
 
+    /** Offset from last PDU which was partially flushed */
+    nb_SIZE pdu_offset;
+
     /** Pool of elements to utilize */
     nb_MBPOOL elempool;
 } nb_SENDQ;
-
 
 struct netbufs_st {
     /** Send Queue */
@@ -104,7 +115,10 @@ struct netbufs_st {
 /**
  * Retrieves a pointer to the buffer related to this span.
  */
-#define SPAN_BUFFER(span) ((span)->parent->root + (span)->offset)
+#define SPAN_BUFFER(span) \
+        (((span)->offset == NETBUFS_INVALID_OFFSET) \
+            ? ((void *)(span)->parent) \
+            : ( (span)->parent->root + (span)->offset ))
 
 /**
  * Reserve a contiguous region of memory, in-order for a given span. The
@@ -176,6 +190,7 @@ netbuf_get_niov(nb_MGR *mgr);
  * @param mgr the manager object
  * @param iov an array of iovec structures
  * @param niov the number of iovec structures allocated.
+ * @param nused how many IOVs are actually required
  *
  * @return the number of bytes which can be flushed in this IOV. If the
  * return value is 0 then there are no more bytes to flush.
@@ -185,7 +200,7 @@ netbuf_get_niov(nb_MGR *mgr);
  * used overall.
  */
 nb_SIZE
-netbuf_start_flush(nb_MGR *mgr, nb_IOV *iov, int niov);
+netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov, int *nused);
 
 /**
  * Indicate that a number of bytes have been flushed. This should be called after
@@ -253,6 +268,61 @@ netbuf_default_settings(nb_SETTINGS *settings);
  */
 void
 netbuf_dump_status(nb_MGR *mgr);
+
+
+/**
+ * Mark a PDU as being enqueued. This should be called whenever the final IOV
+ * for a given PDU has just been enqueued.
+ *
+ * The PDU itself must remain valid and is assumed to contain an 'slnode'
+ * structure which will point to the next PDU. The PDU will later be removed
+ * from the queue when 'end_flush' has been called including its range.
+ *
+ * @param mgr The manager
+ *
+ * @param pdu An opaque pointer
+ *
+ * @param lloff The offset from the pdu pointer at which the slist_node
+ *        structure may be found.
+ */
+void
+netbuf_pdu_enqueue(nb_MGR *mgr, void *pdu, nb_SIZE lloff);
+
+
+/**
+ * This callback is invoked during 'end_flush2'.
+ *
+ * @param pdu The PDU pointer enqueued via netbuf_pdu_enqueue()
+ *
+ * @param remaining A hint passed to the callback indicating how many bytes
+ *        remain on the stream. IFF remaining is greater than the size of the
+ *        PDU the callback may change internal state within the packet to mark
+ *        it as flushed.
+ *
+ *        Note that the size may represent a partial PDU. In this case the
+ *        callback must return the full size of the PDU, and the remainder
+ *        will be stored within netbufs itself so that
+ *
+ * @param arg A pointer passed to the start_flush call; used to correlate any
+ *        data common to the queue itself.
+ *
+ * @return The size of the PDU. This will be used to determine future calls
+ *         to the callback for subsequent PDUs.
+ *
+ *         If size <= remaining then this PDU will be popped off the PDU queue
+ *         and is deemed to be no longer utilized by the send queue (and may
+ *         be released from the mblock allocator; if it's being used).
+ *
+ *         If size > remaining then no further callbacks will be invoked on
+ *         the relevant PDUs.
+ */
+typedef nb_SIZE (*nb_getsize_fn)(void *pdu, nb_SIZE remaining, void *arg);
+
+void
+netbuf_end_flush2(nb_MGR *mgr,
+                  unsigned int nflushed,
+                  nb_getsize_fn callback,
+                  nb_SIZE lloff, void *arg);
 
 #ifdef __cplusplus
 }

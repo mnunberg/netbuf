@@ -1,4 +1,4 @@
-CFLAGS=-Wall -std=c89 -ggdb3
+CFLAGS=-Wall -std=c89 -ggdb3 -O2 -Wstrict-aliasing -Wextra 
 PROXYFLAGS=-DNETBUFS_LIBC_PROXY
 LFLAGS=-Wl,-rpath='$$ORIGIN' -L$(shell pwd)
 
@@ -25,6 +25,13 @@ test-proxy: test.c libnetbuf-proxy.so
 
 test32: test.c libnetbuf32.so
 	$(CC) -m32 $(CFLAGS) -o $@ test.c $(LFLAGS) -lnetbuf32
+
+
+bench: bench.c libnetbuf.so
+	$(CC) $(CFLAGS) -O0 -o $@ bench.c $(LFLAGS) -lnetbuf
+
+bench-proxy: bench.c libnetbuf-proxy.so
+	$(CC) $(CFLAGS) -O0 -o $@ bench.c $(LFLAGS) -lnetbuf-proxy
 
 check: test test32
 	./test

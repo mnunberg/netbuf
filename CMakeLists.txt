@@ -1,0 +1,18 @@
+ADD_LIBRARY(netbuf netbufs.c)
+ADD_LIBRARY(netbuf-proxy netbufs.c)
+SET_TARGET_PROPERTIES(netbuf-proxy
+    PROPERTIES
+    COMPILE_DEFINITIONS NETBUFS_LIBC_PROXY=1)
+
+ADD_EXECUTABLE(test test.c)
+TARGET_LINK_LIBRARIES(test netbuf)
+
+ADD_EXECUTABLE(test-proxy test.c)
+TARGET_LINK_LIBRARIES(test-proxy netbuf-proxy)
+SET_TARGET_PROPERTIES(test-proxy
+    PROPERTIES COMPILE_DEFINITIONS NETBUFS_LIBC_PROXY=1)
+ADD_EXECUTABLE(bench bench.c)
+TARGET_LINK_LIBRARIES(bench netbuf)
+
+ADD_EXECUTABLE(bench-proxy bench.c)
+TARGET_LINK_LIBRARIES(bench-proxy netbuf-proxy)

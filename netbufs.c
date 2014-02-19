@@ -1,3 +1,9 @@
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+/* for ULONG */
+#include <windows.h>
+#endif
+
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -292,7 +298,7 @@ ooo_apply_dealloc(nb_MBLOCK *block, nb_SIZE offset)
 }
 
 
-static void
+static INLINE void
 mblock_release_data(nb_MBPOOL *pool,
                     nb_MBLOCK *block, nb_SIZE size, nb_SIZE offset)
 {
@@ -367,7 +373,7 @@ mblock_release_ptr(nb_MBPOOL *pool, char * ptr, nb_SIZE size)
     slist_node *ll;
 
 #ifdef NETBUFS_LIBC_PROXY
-    block = ptr - sizeof(*block);
+    block = (nb_MBLOCK *)(ptr - sizeof(*block));
     free(block);
     return;
 #endif
@@ -392,11 +398,12 @@ mblock_release_ptr(nb_MBPOOL *pool, char * ptr, nb_SIZE size)
 static int
 mblock_get_next_size(const nb_MBPOOL *pool, int allow_wrap)
 {
+    nb_MBLOCK *block;
     if (SLIST_IS_EMPTY(&pool->avail)) {
         return 0;
     }
 
-    nb_MBLOCK *block = FIRST_BLOCK(pool);
+    block = FIRST_BLOCK(pool);
 
     if (BLOCK_HAS_DEALLOCS(block)) {
         return 0;
@@ -546,15 +553,15 @@ netbuf_enqueue(nb_MGR *mgr, const nb_IOV *bufinfo)
 void
 netbuf_enqueue_span(nb_MGR *mgr, nb_SPAN *span)
 {
-    nb_IOV spinfo = { SPAN_BUFFER(span), span->size };
+    nb_IOV spinfo = NETBUF_IOV_INIT(SPAN_BUFFER(span), span->size);
     netbuf_enqueue(mgr, &spinfo);
 }
 
 nb_SIZE
-netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov)
+netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov, int *nused)
 {
     nb_SIZE ret = 0;
-    nb_IOV *iov_end = iovs + niov + 1;
+    nb_IOV *iov_end = iovs + niov + 1, *iov_start = iovs;
     nb_IOV *iov = iovs;
     slist_node *ll;
     nb_SENDQ *sq = &mgr->sendq;
@@ -591,6 +598,9 @@ netbuf_start_flush(nb_MGR *mgr, nb_IOV *iovs, int niov)
         sq->last_requested = win;
         sq->last_offset = win->len;
     }
+    if (ret && nused) {
+        *nused = iov - iov_start;
+    }
 
     return ret;
 }
@@ -625,6 +635,44 @@ netbuf_end_flush(nb_MGR *mgr, unsigned int nflushed)
     }
 }
 
+void
+netbuf_pdu_enqueue(nb_MGR *mgr, void *pdu, nb_SIZE lloff)
+{
+    nb_SENDQ *q = &mgr->sendq;
+    slist_append(&q->pdus, (slist_node *) ( (char *)pdu + lloff));
+}
+
+void
+netbuf_end_flush2(nb_MGR *mgr,
+                  unsigned int nflushed,
+                  nb_getsize_fn callback,
+                  nb_SIZE lloff,
+                  void *arg)
+{
+    slist_iterator iter;
+    nb_SENDQ *q = &mgr->sendq;
+    netbuf_end_flush(mgr, nflushed);
+
+    nflushed += q->pdu_offset;
+    SLIST_ITERFOR(&q->pdus, &iter) {
+        nb_SIZE cursize;
+        char *ptmp = (char *)iter.cur;
+
+        cursize = callback(ptmp - lloff, nflushed, arg);
+        if (cursize > nflushed) {
+            q->pdu_offset = cursize - nflushed;
+            break;
+        }
+
+        nflushed -= cursize;
+
+        slist_iter_remove(&q->pdus, &iter);
+
+        if (!nflushed) {
+            break;
+        }
+    }
+}
 
 /******************************************************************************
  ******************************************************************************
@@ -659,9 +707,10 @@ void netbuf_default_settings(nb_SETTINGS *settings)
 void
 netbuf_init(nb_MGR *mgr, const nb_SETTINGS *user_settings)
 {
-    memset(mgr, 0, sizeof(*mgr));
     nb_MBPOOL *sqpool = &mgr->sendq.elempool;
     nb_MBPOOL *bufpool = &mgr->datapool;
+
+    memset(mgr, 0, sizeof(*mgr));
 
     if (user_settings) {
         mgr->settings = *user_settings;
@@ -743,7 +792,8 @@ dump_managed_block(nb_MBLOCK *block)
     printf("]\n");
 }
 
-static void dump_sendq(nb_SENDQ *q)
+static void
+dump_sendq(nb_SENDQ *q)
 {
     const char *indent = "  ";
     slist_node *ll;
